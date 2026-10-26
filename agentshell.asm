@@ -78,6 +78,7 @@ default rel
 %define MSG_NOSIGNAL   0x4000
 %define SOL_SOCKET     1
 %define SO_REUSEADDR   2
+%define SO_RCVTIMEO    20
 %define O_RDONLY       0
 %define O_CLOEXEC      0x80000
 %define O_CREAT        0x40
@@ -238,6 +239,22 @@ lg_childkill: db "   child: SIGKILL при изключване"
 lg_childkill_len equ $ - lg_childkill
 lg_fatal:     db "=== FATAL: syscall грешка, exit 1 ==="
 lg_fatal_len  equ $ - lg_fatal
+lg_blfail:    db "FATAL: портът не се закача — bind/listen errno="
+lg_blfail_len equ $ - lg_blfail
+lg_blhint:    db " (порт зает от друг процес?)"
+lg_blhint_len equ $ - lg_blhint
+lg_junk:      db "джънк ("
+lg_junk_len   equ $ - lg_junk
+lg_junk2:     db " B): "
+lg_junk2_len  equ $ - lg_junk2
+lg_jtot:      db "джънк общо ("
+lg_jtot_len   equ $ - lg_jtot
+lg_jtot2:     db " B; дъмпнати първите "
+lg_jtot2_len  equ $ - lg_jtot2
+lg_jend:      db " B)"
+lg_jend_len   equ $ - lg_jend
+lg_timeout:   db "timeout: пиър без валидни данни (преди auth) — отказана"
+lg_timeout_len equ $ - lg_timeout
 str_execfail: db "execveat failed errno="
 str_execfail_len equ $ - str_execfail
 ; ChaCha20: key=0^32, nonce=0^8, ctr=0 → каноничният вектор
@@ -252,6 +269,10 @@ section .data
 ; ============================================================
 align 8
 one:    dd 1
+tv_to:  dq 10                      ; SO_RCVTIMEO: 10 s на четене (пре-auth)
+        dq 0
+tv_off: dq 0                       ; изключване на SO_RCVTIMEO (след auth)
+        dq 0
 sigact: dq sig_handler           ; handler
         dq SA_RESTORER | SA_RESTART ; flags — ЗАДЪЛЖИТЕЛНО на x86-64!
         dq sig_restore           ; restorer (sig_handler не се връща, но ядрото
@@ -320,6 +341,14 @@ yn_h2:      resq 1
 yn_h2l:     resd 1
 peer_len:   resd 1                ; за getpeername
 tmp32:      resb 256              ; буфер за сглобяване на съобщения (стартовият ред е ~102B)
+authed:     resd 1                ; 0 = пре-auth (дедлайнът върви) / 1 = след първата валидна команда
+deadline:   resq 1                ; монотонен дедлайн за пре-auth (секунди)
+mono_ts:    resq 2                ; timespec scratch за CLOCK_MONOTONIC
+rf_got:     resd 1                ; байтове, приети в последното read_full (за дъмпа на джънка)
+rf_err:     resd 1                ; -1 (EOF/нарушение) или -errno от последното read_full
+junk_buf:   resb 64               ; drain_junk: chunk буфер (четене на 64 B стъпки)
+junk_total: resq 1                ; drain_junk: общо байтове, изсмукани след провала
+junk_dmpd:  resq 1                ; drain_junk: от тях hex-нати (до JUNK_CAP)
 ts_y:       resd 1                ; компонентите на локалното време
 ts_mo:      resd 1
 ts_d:       resd 1
@@ -554,14 +583,14 @@ _start:
     mov     edx, 16
     syscall
     test    eax, eax
-    js      fatal
+    js      fatal_bl                       ; errno=98 (EADDRINUSE) и т.н. — явен съобщение
 
     mov     eax, SYS_listen
     mov     edi, [listen_fd]
     mov     esi, 1
     syscall
     test    eax, eax
-    js      fatal
+    js      fatal_bl
 
 ; ============================================================
 ; accept_loop — 1 връзка в даден момент
@@ -576,6 +605,25 @@ accept_loop:
     test    eax, eax
     js      fatal
     mov     [sock_fd], eax
+
+    ; --- пре-auth дедлайн: 60 s общо за salt + първия валиден кадър ---
+    ; (мълчалив/дръпващ скенер не държи единствения слот; след auth — без лимит,
+    ;  за да може операторът да си мысли колкото иска на интерактивния ред)
+    mov     dword [authed], 0
+    mov     eax, SYS_setsockopt
+    mov     edi, [sock_fd]
+    mov     esi, SOL_SOCKET
+    mov     edx, SO_RCVTIMEO
+    lea     r10, [tv_to]
+    mov     r8d, 16
+    syscall
+    mov     eax, SYS_clock_gettime
+    mov     edi, 1                         ; CLOCK_MONOTONIC
+    lea     rsi, [mono_ts]
+    syscall
+    mov     rax, [mono_ts]
+    add     rax, 60
+    mov     [deadline], rax
 
     ; ЛОГ: от кой IP идва връзката
     mov     dword [peer_len], 16
@@ -648,7 +696,25 @@ accept_loop:
     mov     esi, 64
     call    read_full
     test    rax, rax
-    js      conn_close
+    jns     .salt_ok
+    ; пре-auth провал: timeout / джънк — логни и двете възможности
+    cmp     rax, -110
+    jne     .salt_junk
+    lea     rsi, [lg_timeout]              ; мълча 60 s — скенер/полуотворен socket
+    mov     edx, lg_timeout_len
+    call    log_line
+    jmp     conn_close
+.salt_junk:
+    cmp     dword [rf_got], 0
+    jle     .salt_drain
+    lea     rdi, [salt_rx]
+    mov     esi, [rf_got]
+    call    log_junk
+.salt_drain:
+    call    drain_junk                 ; ВСИЧКИ останали байтове от пиъра (не само 64 B)
+.salt_close:
+    jmp     conn_close
+.salt_ok:
     mov     rax, [salt_rx + 56]
     mov     [seed_c2s], rax
 
@@ -667,8 +733,11 @@ accept_loop:
 cmd_loop:
     call    recv_msg
     test    rax, rax
-    js      conn_close                     ; EOF / грешка / нарушение
-
+    js      .recv_fail
+    cmp     dword [authed], 0
+    jnz     .authed                        ; вече удостоен — без нови syscall-и
+    call    auth_now                       ; първата ВАЛИДНА команда = ключът е верен
+.authed:
     ; ЛОГ: всяка получена команда (и отказаните!) — преди yn
     lea     rdi, [pt_buf + 4]
     mov     rsi, rax
@@ -774,6 +843,27 @@ cmd_loop:
     mov     edi, r12d
     call    send_end
     jmp     cmd_loop
+
+.recv_fail:
+    ; пре-auth: логни причината + raw джънка; post-auth: старият път
+    cmp     dword [authed], 0
+    jne     conn_close
+    cmp     rax, -110
+    jne     .no_to
+    lea     rsi, [lg_timeout]
+    mov     edx, lg_timeout_len
+    call    log_line
+.no_to:
+    cmp     dword [rf_got], 0
+    jle     .rf_drain
+    lea     rdi, [ct_buf]
+    mov     esi, [rf_got]
+    call    log_junk                       ; каквото пиърът е пратил (hex, ≤64 B)
+.rf_drain:
+    cmp     dword [rf_err], -110
+    je      conn_close                     ; timeout → дупката е празна, няма какво да дреним
+    call    drain_junk                     ; ОСТАНАЛИЯТ payload — всички байтове
+    jmp     conn_close
 
 ; ============================================================
 ; conn_close — убий/събери ако трябва, затвори всичко, пак accept
@@ -1145,7 +1235,7 @@ recv_msg:
                                            ; call recv_msg — иначе всеки upload изтича 8B стек
     jmp     cmd_loop                       ; качването е обработено — следваща команда
 .fail:
-    mov     rax, -1
+    movsxd  rax, dword [rf_err]           ; -1 (EOF/нарушение) или -errno (напр. -110 timeout)
 .out:
     pop     r14
     pop     r13
@@ -1844,6 +1934,8 @@ read_full:
     push    rbp
     mov     rbx, rdi
     mov     rbp, rsi
+    mov     dword [rf_got], 0              ; статистика за повикващия (дъмпа на джънка)
+    mov     dword [rf_err], -1             ; по подразбиране: EOF/грешка без код
     test    rbp, rbp
     jz      .ok
 .rf:
@@ -1853,12 +1945,35 @@ read_full:
     mov     rdx, rbp
     syscall
     test    rax, rax
-    jle     .fail                          ; 0=EOF, <0=грешка
+    jg      .have
+    js      .err                           ; <0 = -errno (напр. -11 EAGAIN от SO_RCVTIMEO)
+    jmp     .fail                          ; 0 = EOF
+.have:
     add     rbx, rax
+    add     [rf_got], eax
     sub     rbp, rax
     jnz     .rf
 .ok:
     xor     eax, eax
+    pop     rbp
+    pop     rbx
+    ret
+.err:
+    mov     [rf_err], eax
+    cmp     rax, -11                       ; EAGAIN — времето за това четене изтече
+    jne     .fail_raw
+    cmp     dword [authed], 0
+    jne     .fail_raw                      ; post-auth: без дедлайн изобщо
+    mov     eax, SYS_clock_gettime
+    mov     edi, 1                         ; CLOCK_MONOTONIC
+    lea     rsi, [mono_ts]
+    syscall
+    mov     rax, [mono_ts]
+    cmp     rax, [deadline]
+    jl      .rf                            ; дедлайнът не е изтекъл — пак read (дръпващ пиър умира на дедлайна)
+    mov     dword [rf_err], -110           ; ETIMEDOUT
+.fail_raw:
+    movsxd  rax, dword [rf_err]
     pop     rbp
     pop     rbx
     ret
@@ -2655,6 +2770,170 @@ log_cmd2:
     ret
 
 ; ------------------------------------------------------------
+; auth_now — първата валидна команда мина: authed=1 + без SO_RCVTIMEO
+; ------------------------------------------------------------
+auth_now:
+    push    rax                            ; ПАЗИ rax — повикващият го носи към log_cmd2!
+    mov     dword [authed], 1
+    mov     eax, SYS_setsockopt
+    mov     edi, [sock_fd]
+    mov     esi, SOL_SOCKET
+    mov     edx, SO_RCVTIMEO
+    lea     r10, [tv_off]
+    mov     r8d, 16
+    syscall
+    pop     rax
+    ret
+
+; ------------------------------------------------------------
+; log_junk(rdi = buf, esi = n) — "[ts] джънк (N B): HH HH …" (макс 64 B)
+; суровите байтове на пиър, който не говори ЕО-42
+; ------------------------------------------------------------
+log_junk:
+    cmp     dword [log_fd], 0
+    jl      .ret
+    push    rbx
+    push    r12
+    push    r14
+    mov     rbx, rdi                       ; buf (fmt_ts пази rbx/r12)
+    mov     r12d, esi                      ; n
+    cmp     r12d, 64
+    jbe     .cap
+    mov     r12d, 64
+.cap:
+    test    r12d, r12d
+    jle     .pop
+    lea     rdi, [log_buf]
+    call    fmt_ts                         ; rcx = дължина на префикса
+    lea     r14, [log_buf]
+    add     r14, rcx
+    lea     rsi, [lg_junk]
+    mov     edx, lg_junk_len
+    call    cp_log
+    mov     rdi, r14
+    mov     eax, r12d
+    call    fmt_dec                        ; rcx = цифри
+    add     r14, rcx
+    lea     rsi, [lg_junk2]
+    mov     edx, lg_junk2_len
+    call    cp_log
+    xor     ecx, ecx
+.hex:
+    cmp     ecx, r12d
+    jae     .flush
+    movzx   eax, byte [rbx + rcx]
+    mov     rdi, r14
+    call    fmt_hex2                       ; 2 hex символа
+    add     r14, 2
+    mov     byte [r14], ' '
+    inc     r14
+    inc     ecx
+    jmp     .hex
+.flush:
+    mov     byte [r14], 10
+    inc     r14
+    mov     eax, SYS_write
+    mov     edi, [log_fd]
+    lea     rsi, [log_buf]
+    mov     rdx, r14
+    sub     rdx, rsi
+    syscall
+.pop:
+    pop     r14
+    pop     r12
+    pop     rbx
+.ret:
+    ret
+
+; ------------------------------------------------------------
+; drain_junk — изсмуква ВСИЧКИ останали байтове от sock_fd след
+;   пре-auth провал: чете на 64 B стъпки до EOF/EAGAIN/грешка/дедлайн;
+;   всеки стъпка → log_junk (hex ред); накрая обобщен ред
+;   "джънк общо (N B)" [+ "; дъмпнати първите M B" при отрязане].
+;   Кап JUNK_CAP hex-байта на връзка (flood → дискът остама жив),
+;   но ОБЩОТО число приети байтове винаги е истинско.
+;   Край: EOF / EAGAIN (10 s мълчание по SO_RCVTIMEO) / грешка / 60 s дедлайн.
+;   Пази r14 (cp_log пише през него); стекът е балансиран.
+; ------------------------------------------------------------
+JUNK_CAP equ 4*1024*1024                ; макс hex-нати байтове на връзка (~13 MB журнал)
+drain_junk:
+    cmp     dword [log_fd], 0
+    jl      .ret
+    mov     qword [junk_total], 0
+    mov     qword [junk_dmpd], 0
+.dj:
+    xor     eax, eax                       ; SYS_read
+    mov     edi, [sock_fd]
+    lea     rsi, [junk_buf]
+    mov     edx, 64
+    syscall
+    test    rax, rax
+    jg      .have
+    jmp     .done                          ; 0 = EOF / <0 = EAGAIN или грешка → край
+.have:
+    push    rax
+    add     [junk_total], rax
+    mov     rcx, [junk_dmpd]
+    cmp     rcx, JUNK_CAP
+    jae     .nodump                        ; над капа — само броим, без hex
+    mov     esi, eax                       ; n (<=64; log_junk сам капира)
+    lea     rdi, [junk_buf]
+    call    log_junk
+    pop     rcx
+    add     [junk_dmpd], rcx
+    jmp     .tick
+.nodump:
+    pop     rcx
+.tick:
+    mov     eax, SYS_clock_gettime
+    mov     edi, 1                         ; CLOCK_MONOTONIC
+    lea     rsi, [mono_ts]
+    syscall
+    mov     rax, [mono_ts]
+    cmp     rax, [deadline]
+    jge     .done                          ; 60 s пре-auth дедлайн важи и тук (flood не държи слота вечно)
+    jmp     .dj
+.done:
+    cmp     qword [junk_total], 0
+    je      .ret                           ; нищо ново — 64 B редът на caller-а стига
+    lea     rdi, [log_buf]
+    call    fmt_ts                         ; rcx = дължина на префикса
+    lea     r14, [log_buf]
+    add     r14, rcx
+    lea     rsi, [lg_jtot]
+    mov     edx, lg_jtot_len
+    call    cp_log
+    mov     rdi, r14
+    mov     rax, [junk_total]
+    call    fmt_dec                        ; rcx = цифри
+    add     r14, rcx
+    mov     rax, [junk_dmpd]
+    cmp     rax, [junk_total]
+    jae     .simple                        ; всичко е дъмпнато → без отрязка
+    lea     rsi, [lg_jtot2]
+    mov     edx, lg_jtot2_len
+    call    cp_log
+    mov     rdi, r14
+    mov     rax, [junk_dmpd]
+    call    fmt_dec
+    add     r14, rcx
+.simple:
+    lea     rsi, [lg_jend]
+    mov     edx, lg_jend_len
+    call    cp_log
+.flush:
+    mov     byte [r14], 10
+    inc     r14
+    mov     eax, SYS_write
+    mov     edi, [log_fd]
+    lea     rsi, [log_buf]
+    mov     rdx, r14
+    sub     rdx, rsi
+    syscall
+.ret:
+    ret
+
+; ------------------------------------------------------------
 ; log_out(rdi = buf, rsi = len) — суровият изход на командата
 ;   управл. символи (<0x20 освен \n,\t; 0x7F) → \xHH; UTF-8 минава
 ;   ПАЗИ rdi/rsi (caller-ът send_msg ги ползва веднага след това)
@@ -2917,6 +3196,44 @@ fatal:
     lea     rsi, [lg_fatal]
     mov     edx, lg_fatal_len
     call    log_line
+    mov     eax, SYS_write                 ; и на stderr — операторът го вижда в screen
+    mov     edi, 2
+    lea     rsi, [lg_fatal]
+    mov     edx, lg_fatal_len
+    syscall
     mov     eax, SYS_exit
     mov     edi, 1
     syscall
+
+; bind()/listen() провал: явен съобщение с errno — на stderr И в журнала,
+; после exit 1. (rax = -errno при скока)
+fatal_bl:
+    neg     eax
+    mov     r12d, eax                      ; errno (положително)
+    lea     r14, [tmp32]
+    lea     rsi, [lg_blfail]
+    mov     edx, lg_blfail_len
+    call    cp_log
+    mov     rdi, r14
+    mov     eax, r12d
+    call    fmt_dec                        ; rcx = цифри
+    add     r14, rcx
+    lea     rsi, [lg_blhint]
+    mov     edx, lg_blhint_len
+    call    cp_log
+    mov     byte [r14], 10
+    inc     r14
+    mov     eax, SYS_write                 ; STDERR — човекът да го види веднага
+    mov     edi, 2
+    lea     rsi, [tmp32]
+    mov     rdx, r14
+    sub     rdx, rsi
+    syscall
+    lea     rsi, [tmp32]                   ; ЖУРНАЛ (с [ts])
+    mov     rdx, r14
+    sub     rdx, rsi
+    call    log_line
+    mov     eax, SYS_exit
+    mov     edi, 1
+    syscall
+
