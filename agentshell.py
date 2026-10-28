@@ -12,13 +12,15 @@
 #
 # ЛИЦЕНЗ:   UL-1.0
 # =================================================================
-# agentshell.py — клиент за протокол REV.4 (AEAD, двупосочна свежест):
-#   пакет = [L u32 BE][ct L B][tag 16B]; таг = Poly1305(kpoly,
-#   dir ‖ p u64LE ‖ L u32BE ‖ 0³ ‖ ct); verify ПРЕДИ decrypt.
-#   KDF: KS0 = ChaCha20(PSK, seed_s2c ⊕ seed_c2s) — свежестта е
-#   ДВУПОСОЧНА: replay на стар „филм" S→C към клиента умира (§13.2);
-#   S→C шифър = PSK. Хендшейкът (64+64 B salt) е непроменен.
-#   REV.4 = REV.3 (AEAD + @get) с KDF nonce от двата seed-а — 0 нови байта.
+# agentshell.py — клиент за протокол REV.5 (AEAD, еднократен MAC ключ/пакет):
+#   пакет = [L u32 BE][ct L B][tag 16B]; verify ПРЕДИ decrypt.
+#   OTK (REV.5): otk = ChaCha20(kpoly_dir, LE64(p))[0:32) — ЕДНОКРАТЕН
+#   Poly1305 ключ на пакет (Wegman-Carter, RFC 8439 маниер); таг =
+#   Poly1305(otk, dir ‖ p u64LE ‖ L u32BE ‖ 0³ ‖ ct). Корени: kpoly =
+#   KS0[32:64) (C→S), kpoly_s2c = ChaCha20(kpoly, 2^64−1)[0:32) (S→C) —
+#   преизползването на MAC ключ (GCD атака) става невъзможно.
+#   KDF REV.4 (KS0 от двата seed-а) е непроменен; S→C шифър = PSK;
+#   хендшейкът (64+64 B salt) е непроменен — 0 нови байта по кабела.
 #
 # usage: agentshell.py <host> <port> <hexkey64> [--yn] | --selftest
 # =================================================================
@@ -88,12 +90,20 @@ class AgentShell:
         nonce = bytes(a ^ b for a, b in zip(self.seed_rx, self.seed_tx))
         ks0 = chacha_xor(self.key, nonce, bytes(64))
         self.enc_key = ks0[:32]         # C→S сесиен ключ (свежест!)
-        self.kpoly = ks0[32:64]         # Poly1305 ключ
+        self.kpoly = ks0[32:64]         # REV.5: корен за C→S OTK
+        # REV.5: корен за S→C OTK — производен с РЕЗЕРВИРАН нонс 2^64−1
+        # (OTK нонсовете са LE64(p), p ∈ [0, 2^64−1) — никога не го стига)
+        self.kpoly_s2c = chacha_xor(self.kpoly, b"\xff" * 8, bytes(64))[:32]
     def _n(self, seed, p):
         return ((int.from_bytes(seed, "little") + p) & 0xffffffffffffffff).to_bytes(8, "little")
     def _tag(self, direction, p, L, ct):
+        # REV.5: еднократен Poly1305 ключ на пакет (Wegman-Carter):
+        #   otk = ChaCha20(kpoly_dir, LE64(p))[0:32); всеки таг под нов ключ
+        #   → преизползване/GCD атака върху MAC ключа е невъзможна
+        root = self.kpoly if direction == b"C" else self.kpoly_s2c
+        otk = chacha_xor(root, struct.pack("<Q", p), bytes(64))[:32]
         hdr = direction + struct.pack("<Q", p) + struct.pack(">I", L) + b"\0\0\0"
-        return poly1305(self.kpoly, hdr + ct)
+        return poly1305(otk, hdr + ct)
     def _encrypt(self, pt):
         out = b""
         for j in range(len(pt) // 64):
@@ -195,7 +205,7 @@ class AgentShell:
                     pass
 
 USAGE = """\
-ЕО-42 · agentshell клиент (протокол REV.4 — AEAD, двупосочна свежест)
+ЕО-42 · agentshell клиент (протокол REV.5 — AEAD, еднократен MAC ключ/пакет)
 употреба:
   agentshell.py <host> <port> <hex_key_64> [--yn] | --selftest | --help
 
@@ -214,10 +224,11 @@ USAGE = """\
   @get <дистанционен_път> [локален_файл]   сваля файла (редовни файлове,
                                            ≤1GB; без локален → basename)
 
-REV.4: всеки пакет носи Poly1305 таг (verify преди decrypt), а сесийните
-  ключове се извеждат от ДВАТА seed-а (сървърски ⊕ клиентски) — replay
-  на стари сесии И стар „филм" S→C към клиента умира с „фалшив таг".
-  Грешен ключ = фалшив таг при ПЪРВАТА команда (мълчалив close).
+REV.5: всеки таг се изчислява под ЕДНОКРАТЕН ключ (otk = f(kpoly_dir, p))
+  — преизползването на Poly1305 ключа (GCD атака) е невъзможно. KDF REV.4
+  (двата seed-а) е непроменен: replay на стари сесии И стар „филм" S→C
+  към клиента умира с „фалшив таг". Грешен ключ = фалшив таг при ПЪРВАТА
+  команда (мълчалив close).
 """
 
 def conn_fail(c, e):
@@ -253,7 +264,12 @@ if __name__ == "__main__":
     if "--selftest" in flags:
         assert chacha_xor(bytes(32), bytes(8), bytes(64)) == VEC, "ChaCha20 FAIL"
         assert poly1305(POLY_K, POLY_M) == POLY_T, "Poly1305 FAIL"
-        print("client selftest OK (ChaCha20 + Poly1305)"); sys.exit(0)
+        # REV.5: OTK дисциплина — различни за различни p и за различен корен
+        _r = bytes(range(32))
+        _ots = {chacha_xor(_r, struct.pack("<Q", p), bytes(64))[:32] for p in range(8)}
+        assert len(_ots) == 8, "OTK колизия по p?!"
+        assert chacha_xor(_r, b"\xff" * 8, bytes(64))[:32] not in _ots,             "OTK колизия с резервирания нонс?!"
+        print("client selftest OK (ChaCha20 + Poly1305 + OTK)"); sys.exit(0)
     if "--help" in flags or "-h" in flags:
         print(USAGE); sys.exit(0)
     if len(pos) < 3:
@@ -310,4 +326,3 @@ if __name__ == "__main__":
         except (ConnectionError, ProtocolError) as e:
             conn_fail(c, e)
         print(f"\n[exit {c.last_exit}]")
-

@@ -27,13 +27,14 @@
 ;   ./agentshell <port> <hex_key_64>
 ;   ./agentshell --selftest
 ;
-; Протокол ЕО-42 (wire REV.4 — AEAD; детайли: README REV. 4, §3–§7, §13):
+; Протокол ЕО-42 (wire REV.5 — AEAD/OTK; детайли: README REV. 5, §3–§7, §11, §13):
 ;   salt 64B (ChaCha20(key, BASE_dir) XOR random64; seed = ct[56..63])
 ;   KDF (без нови wire байтове): KS0 = ChaCha20(key, seed_s2c ⊕ seed_c2s)
 ;        enc_key_c2s = KS0[0..32)  — сесиен ключ C→S (двупосочна свежест!);
-;        kpoly       = KS0[32..64) — Poly1305 ключ (общ, dir байт в MAC входа)
+;        kpoly       = KS0[32..64) — корен C→S OTK; kpoly_s2c — производен корен S→C
 ;   пакет = [L u32 BE][ct L B][tag 16B]; 64 ≤ L ≤ 1024, L%64 == 0;
-;        tag = Poly1305(kpoly, 'C'|'S' ‖ p u64LE ‖ L u32BE ‖ 0³ ‖ ct)
+;        otk = ChaCha20(kpoly_dir, LE64(p))[0:32) — ЕДНОКРАТЕН ключ/пакет (REV.5)
+;        tag = Poly1305(otk, 'C'|'S' ‖ p u64LE ‖ L u32BE ‖ 0³ ‖ ct)
 ;        verify ПРЕДИ decrypt (V1 replay / V2+V3 bit-flip / филмът §13.2 умират)
 ;   съобщение = [len u32 BE][data] zero-pad до %64 (вътре в ct — както REV.2)
 ;   шифър: C→S = enc_key_c2s (сесиен); S→C = key (PSK)
@@ -455,7 +456,8 @@ log_prev:    resb 32              ; име на предишния журнал 
 rot_msg:     resb 96              ; маркерът при ротация (директен write, без log_line)
 ; --- Вълна 2 (REV.3): AEAD ---
 enc_key:    resb 32               ; сесиен ключ C→S (KDF: KS0[0..32))
-kpoly:      resb 32               ; Poly1305 ключ (KS0[32..64); общ, dir байт в MAC)
+kpoly:      resb 32               ; REV.5: корен за C→S OTK (KS0[32..64))
+kpoly_s2c:  resb 32               ; REV.5: корен за S→C OTK = ChaCha20(kpoly, 2^64−1)[0:32)
 ks0:        resb 64               ; KDF scratch (keystroke блок)
 kdf_nonce:  resq 1                ; seed_s2c ⊕ seed_c2s
 pkt_hdr:    resb 16               ; MAC вход: [dir 1][p 8 LE][L 4 BE][pad 3]
@@ -830,8 +832,8 @@ accept_loop:
     mov     rax, [salt_rx + 56]
     mov     [seed_c2s], rax
 
-    ; REV.4 KDF: KS0 = ChaCha20(PSK, seed_s2c ⊕ seed_c2s) → enc_key_c2s = KS0[0..32),
-    ; kpoly = KS0[32..64). Свежестта става ДВУПОСОЧНА: replay на стари C→S кадри
+    ; REV.4/5 KDF: KS0 = ChaCha20(PSK, seed_s2c ⊕ seed_c2s) → enc_key_c2s = KS0[0..32),
+    ; kpoly = KS0[32..64) = корен C→S OTK. Свежестта е ДВУПОСОЧНА: replay на стари C→S кадри
     ; срещу нова сесия И replay на стар "филм" S→C към клиента (MITM пуска записан
     ; salt_s + стари кадри към жертва със СВЕЖ seed_c2s) носят таг под СТАР kpoly
     ; → пада (V1 + резидуалът §13.2 умират).
@@ -855,6 +857,22 @@ accept_loop:
     inc     ecx
     cmp     ecx, 32
     jb      .kdf_cp
+
+    ; REV.5: kpoly_s2c — корен за S→C OTK, производен от kpoly (C→S) с
+    ; РЕЗЕРВИРАН нонс 2^64−1: OTK нонсовете са LE64(p), p ∈ [0, 2^64−1)
+    ; (wraparound практически недостижим, §4) → никоя OTK не удря него.
+    lea     rdi, [zeros64]                 ; src (контракт: rdi=src, rsi=dst!)
+    lea     rsi, [ks0]
+    lea     rdx, [kpoly]
+    mov     rcx, -1
+    call    chacha_block
+    xor     ecx, ecx
+.ksp_cp:
+    mov     al, [ks0 + rcx]
+    mov     [kpoly_s2c + rcx], al
+    inc     ecx
+    cmp     ecx, 32
+    jb      .ksp_cp
 
     ; ЛОГ: ръкостискането мина - "в кавички"
     lea     rsi, [lg_hs]
@@ -1839,7 +1857,13 @@ read_pkt:
     mov     word [rdi + 13], 0
     mov     byte [rdi + 15], 0
     ; --- очакван таг: split API (hdr и ct са в различни буфери!) ---
-    lea     rdi, [kpoly]
+    ; REV.5: OTK = ChaCha20(kpoly, LE64(p_c2s))[0:32) — еднократен MAC ключ
+    lea     rdi, [zeros64]
+    lea     rsi, [ks0]
+    lea     rdx, [kpoly]
+    mov     rcx, [p_c2s]
+    call    chacha_block
+    lea     rdi, [ks0]                     ; Poly1305 ключ = OTK (ks0[0:32))
     call    poly1305_init
     lea     rsi, [pkt_hdr]
     mov     edx, 16
@@ -3155,7 +3179,14 @@ send_msg:
     mov     [pkt_hdr + 9], eax
     mov     word [pkt_hdr + 13], 0
     mov     byte [pkt_hdr + 15], 0
-    lea     rdi, [kpoly]
+    ; REV.5: OTK = ChaCha20(kpoly_s2c, LE64(p_start+k))[0:32) — еднократен ключ
+    lea     rdi, [zeros64]
+    lea     rsi, [ks0]
+    lea     rdx, [kpoly_s2c]
+    mov     rcx, [p_start_tx]
+    add     rcx, r14
+    call    chacha_block
+    lea     rdi, [ks0]                     ; Poly1305 ключ = OTK (ks0[0:32))
     call    poly1305_init
     lea     rsi, [pkt_hdr]
     mov     edx, 16
@@ -4828,5 +4859,4 @@ fatal_bl:
     mov     eax, SYS_exit
     mov     edi, 1
     syscall
-
 
