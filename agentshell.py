@@ -21,6 +21,11 @@
 #   преизползването на MAC ключ (GCD атака) става невъзможно.
 #   KDF REV.4 (KS0 от двата seed-а) е непроменен; S→C шифър = PSK;
 #   хендшейкът (64+64 B salt) е непроменен — 0 нови байта по кабела.
+#   REV.5b: send_msg е СТРИЙМ — блоковете се шифроват и се пращат пакет по
+#   пакет (1024 B), щом са готови; по кабела е БАЙТ-ИДЕНТИЧНО с буферния
+#   еталон (_encrypt — selftest доказва). Първият пакет тръгва мигновено →
+#   3 s пре-auth дедлайнът на сървъра е безпредметен за @put на всякакъв
+#   размер; @put тече директно от диска (O(1) RAM, upload_file).
 #
 # usage: agentshell.py <host> <port> <hexkey64> [--yn] | --selftest
 # =================================================================
@@ -105,6 +110,9 @@ class AgentShell:
         hdr = direction + struct.pack("<Q", p) + struct.pack(">I", L) + b"\0\0\0"
         return poly1305(otk, hdr + ct)
     def _encrypt(self, pt):
+        """ЕТАЛОН: буферен шифър на цялото съобщение наведнъж (мутира p_tx).
+        send_msg върви по стрийм пътя (_packets); тази функция стои като
+        еталон — selftest сравнява двата пътя байт-по-байт (REV.5b)."""
         out = b""
         for j in range(len(pt) // 64):
             if j % 16 == 0:
@@ -113,16 +121,64 @@ class AgentShell:
                 nonce = out[-8:]
             out += chacha_xor(self.enc_key, nonce, pt[j*64:(j+1)*64])
         return out
-    def send_msg(self, data):
-        pt = struct.pack(">I", len(data)) + data
-        pt += b"\0" * (-len(pt) % 64)
+    def _packets(self, pieces, total_plain):
+        """REV.5b: стрийм пакетиране — връща (p, ct_пакет) щом се съберат
+        PKT_MAX байта ct, без да чака цялото съобщение. pt = [L u32 BE] +
+        pieces + падинг до 64; веригата: лидер на всеки 16-ти блок (nonce =
+        _n(seed_tx, p_start + j//16)), иначе nonce = опашката на предишния
+        ct блок. БАЙТ-ИДЕНТИЧНО с буферния еталон (selftest). Контракт:
+        sum(len(x) for x in pieces) == 4 + total_plain (виканият дава и
+        4-байтовия хедър като ПЪРВО piece)."""
+        total = 4 + total_plain
+        total_ct = total + (-total % 64)
         p_start = self.p_tx
-        ct = self._encrypt(pt)
-        for k in range((len(ct) + PKT_MAX - 1) // PKT_MAX):
-            sl = ct[k*PKT_MAX:(k+1)*PKT_MAX]
-            L = len(sl)
-            tag = self._tag(b"C", p_start + k, L, sl)
-            self.s.sendall(struct.pack(">I", L) + sl + tag)
+        npkt = (total_ct + PKT_MAX - 1) // PKT_MAX
+        self.p_tx = p_start + npkt       # броячът се резервира EAGER — изоставен
+                                         # generator не развързва сесията (таговете
+                                         # носят p изрично, не четат p_tx)
+        blk = bytearray()                # текущ pt блок (до 64 B)
+        out = bytearray()                # ct на текущия пакет (до PKT_MAX)
+        tail = b""                       # последните 8 B от предишния ct блок
+        j = 0                            # глобален блоков индекс в съобщението
+        k = 0                            # индекс на пакета в съобщението
+        for piece in pieces:
+            i = 0
+            while i < len(piece):
+                take = min(64 - len(blk), len(piece) - i)
+                blk += piece[i:i + take]
+                i += take
+                if len(blk) < 64:
+                    continue
+                nonce = self._n(self.seed_tx, p_start + (j >> 4)) if j % 16 == 0 else tail
+                c = chacha_xor(self.enc_key, nonce, bytes(blk))
+                tail = c[56:64]
+                out += c
+                blk.clear()
+                j += 1
+                if len(out) == PKT_MAX:
+                    yield p_start + k, bytes(out)
+                    k += 1
+                    out.clear()
+        if blk:                          # последен непълен блок + падинг
+            blk += b"\0" * (64 - len(blk))
+            nonce = self._n(self.seed_tx, p_start + (j >> 4)) if j % 16 == 0 else tail
+            c = chacha_xor(self.enc_key, nonce, bytes(blk))
+            tail = c[56:64]
+            out += c
+            blk.clear()
+        if out:                          # последен пакет (кратък или пълен)
+            yield p_start + k, bytes(out)
+            k += 1
+            out.clear()
+        assert k == npkt and not blk and not out, "стрийм пакетиране: броене?"
+    def _send(self, pkts):
+        for p, pkt in pkts:
+            tag = self._tag(b"C", p, len(pkt), pkt)
+            self.s.sendall(struct.pack(">I", len(pkt)) + pkt + tag)
+    def send_msg(self, data):
+        # REV.5b: стрийм — първият пакет тръгва по кабела щом е готов,
+        # без да чака цялото съобщение да се шифрова (байт-идентично)
+        self._send(self._packets([struct.pack(">I", len(data)), data], len(data)))
     def _recv_pkt(self):
         L = struct.unpack(">I", self._exact(4))[0]
         if not (64 <= L <= PKT_MAX) or L % 64:
@@ -162,19 +218,51 @@ class AgentShell:
             yield data
 
     def upload(self, path, data):
-        """@put (REV.3): [00][path_len BE16][path][size BE64][data]"""
+        """@put (REV.3): [00][path_len BE16][path][size BE64][data]
+        (data в RAM; за файлове ползвай upload_file — стрийм от диска)"""
         p = path.encode() if isinstance(path, str) else path
         d = data if isinstance(data, (bytes, bytearray)) else data.encode()
         if not 1 <= len(p) <= 4096:
             raise ValueError("пътят трябва да е 1..4096 байта")
-        payload = b"\x00" + len(p).to_bytes(2, "big") + p + len(d).to_bytes(8, "big") + d
-        self.send_msg(payload)
+        head = b"\x00" + len(p).to_bytes(2, "big") + p + len(d).to_bytes(8, "big")
+        payload = head + d
+        self._send(self._packets([struct.pack(">I", len(payload)), payload], len(payload)))
         text = b""
         while True:
             ln, chunk = self.recv_msg()
             if ln == 0:
                 return struct.unpack(">I", chunk[:4])[0], text.decode("utf-8", "replace")
             text += chunk
+
+    def upload_file(self, lpath, rpath, chunk=65536):
+        """@put директно от диска (REV.5b): файлът НИКОГА не е цял в RAM
+        (O(1) памет) и първият пакет тръгва мигновено — 3 s пре-auth
+        дедлайнът на сървъра е безпредметен за всякакъв размер."""
+        p = rpath.encode() if isinstance(rpath, str) else rpath
+        if not 1 <= len(p) <= 4096:
+            raise ValueError("пътят трябва да е 1..4096 байта")
+        f = open(lpath, "rb")
+        try:
+            size = os.fstat(f.fileno()).st_size
+            head = b"\x00" + len(p).to_bytes(2, "big") + p + size.to_bytes(8, "big")
+            total = len(head) + size
+            def pieces():
+                yield struct.pack(">I", total)   # 4B length header — ПЪРВО piece!
+                yield head
+                while True:
+                    c = f.read(chunk)
+                    if not c:
+                        break
+                    yield c
+            self._send(self._packets(pieces(), total))
+        finally:
+            f.close()
+        text = b""
+        while True:
+            ln, ch = self.recv_msg()
+            if ln == 0:
+                return struct.unpack(">I", ch[:4])[0], text.decode("utf-8", "replace")
+            text += ch
 
     def download(self, rpath, local):
         """@get (Вълна 3): [01][path_len BE16][път] → DATA chunkове + END.
@@ -224,6 +312,9 @@ USAGE = """\
   @get <дистанционен_път> [локален_файл]   сваля файла (редовни файлове,
                                            ≤1GB; без локален → basename)
 
+REV.5b: @put тече директно от диска (O(1) RAM) и стриймва шифровани пакети
+  от мига на командата — първият кадър тръгва мигновено, без целия файл в
+  паметта и без мълчание преди трансфера (3 s пре-auth дедлайн: безпредметен).
 REV.5: всеки таг се изчислява под ЕДНОКРАТЕН ключ (otk = f(kpoly_dir, p))
   — преизползването на Poly1305 ключа (GCD атака) е невъзможно. KDF REV.4
   (двата seed-а) е непроменен: replay на стари сесии И стар „филм" S→C
@@ -269,7 +360,52 @@ if __name__ == "__main__":
         _ots = {chacha_xor(_r, struct.pack("<Q", p), bytes(64))[:32] for p in range(8)}
         assert len(_ots) == 8, "OTK колизия по p?!"
         assert chacha_xor(_r, b"\xff" * 8, bytes(64))[:32] not in _ots,             "OTK колизия с резервирания нонс?!"
-        print("client selftest OK (ChaCha20 + Poly1305 + OTK)"); sys.exit(0)
+        # REV.5b: стрийм пътят (_packets/send_msg) е БАЙТ-ИДЕНТИЧЕН с буферния
+        # еталон (_encrypt) — по кабелния формат, вкл. тагове и брояч p
+        _c = AgentShell.__new__(AgentShell)          # без socket
+        _c.enc_key = bytes(range(32))
+        _c.seed_tx = b"\x10\x32\x54\x76\x98\xba\xdc\xfe"
+        _c.kpoly = bytes(range(32, 64))
+        _sizes = ([0, 1, 60, 64, 1019, 1020, 1021, 2044, 2045, 3068, 4095,
+                   4096, 8188, 8189, 16380, 16381] +                 # гранични
+                  [(i * 7919) % 9000 + 1 for i in range(1, 25)] +    # разхвърляни
+                  [100_000, 262_144])                                # големи
+        _n_chk = 0
+        for _sz in _sizes:
+            _d = os.urandom(_sz)
+            _pt = struct.pack(">I", len(_d)) + _d + b"\0" * (-(4 + len(_d)) % 64)
+            _c.p_tx = 0
+            _whole = _c._encrypt(_pt)                                # еталон
+            _ref = b""
+            for _k in range((len(_whole) + PKT_MAX - 1) // PKT_MAX):
+                _sl = _whole[_k * PKT_MAX:(_k + 1) * PKT_MAX]
+                _ref += struct.pack(">I", len(_sl)) + _sl + _c._tag(b"C", _k, len(_sl), _sl)
+            _c.p_tx = 0
+            _strm = b""; _ps = []
+            for _p, _pkt in _c._packets([struct.pack(">I", len(_d)), _d], len(_d)):
+                _ps.append(_p)
+                _strm += struct.pack(">I", len(_pkt)) + _pkt + _c._tag(b"C", _p, len(_pkt), _pkt)
+            assert _ref == _strm, f"стрийм ≠ цяло при n={_sz}!"
+            assert _ps == list(range(len(_ps))), f"p не е решетъчно последователен при n={_sz}!"
+            assert _c.p_tx == len(_ps), f"p_tx счетен грешно при n={_sz}!"
+            _n_chk += 1
+        # разкъсани pieces (груби файлови четения) → същите байтове
+        _d = os.urandom(5000)
+        _w1 = b""; _c.p_tx = 0
+        for _p, _pkt in _c._packets([struct.pack(">I", len(_d))] + [_d[i:i+7] for i in range(0, len(_d), 7)], len(_d)):
+            _w1 += struct.pack(">I", len(_pkt)) + _pkt + _c._tag(b"C", _p, len(_pkt), _pkt)
+        _w2 = b""; _c.p_tx = 0
+        for _p, _pkt in _c._packets([struct.pack(">I", len(_d)), _d], len(_d)):
+            _w2 += struct.pack(">I", len(_pkt)) + _pkt + _c._tag(b"C", _p, len(_pkt), _pkt)
+        assert _w1 == _w2, "стрийм зависи от разкъсването на pieces?!"
+        # броячът продължава НАД съобщенията (решетъчна инварианта на сесията)
+        _c.p_tx = 0
+        for _p, _ in _c._packets([struct.pack(">I", 3000), b"A" * 3000], 3000):
+            _last = _p
+        assert _last == 2 and _c.p_tx == 3, "броене на пакети над съобщение?!"
+        assert next(iter(_c._packets([struct.pack(">I", 0)], 0)))[0] == 3, \
+            "броячът не продължава над съобщения?!"
+        print(f"client selftest OK (ChaCha20 + Poly1305 + OTK + стрийм≡цяло ×{_n_chk} размера)"); sys.exit(0)
     if "--help" in flags or "-h" in flags:
         print(USAGE); sys.exit(0)
     if len(pos) < 3:
@@ -288,11 +424,9 @@ if __name__ == "__main__":
             if len(parts) < 3 or not parts[1] or not parts[2]:
                 print("употреба: @put <локален_файл> <дистанционен_път>"); continue
             try:
-                data = open(parts[1], "rb").read()
+                st, msg = c.upload_file(parts[1], parts[2])   # REV.5b: стрийм от диска
             except OSError as e:
                 print(f"[грешка] {e}"); continue
-            try:
-                st, msg = c.upload(parts[2], data)
             except (ConnectionError, ProtocolError) as e:
                 conn_fail(c, e)
             print(f"{msg}\n[exit {st}]")
@@ -326,3 +460,4 @@ if __name__ == "__main__":
         except (ConnectionError, ProtocolError) as e:
             conn_fail(c, e)
         print(f"\n[exit {c.last_exit}]")
+
